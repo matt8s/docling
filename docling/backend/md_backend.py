@@ -10,6 +10,7 @@ import warnings
 from copy import deepcopy
 from enum import Enum
 from html import unescape
+from html.entities import html5
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, cast
@@ -21,8 +22,10 @@ from docling_core.types.doc import (
     DoclingDocument,
     DocumentOrigin,
     Formatting,
+    FormulaItem,
     GroupLabel,
     ImageRef,
+    InlineGroup,
     ListItem,
     NodeItem,
     RefItem,
@@ -51,6 +54,14 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
 from docling.exceptions import DocumentLoadError
 from docling.utils.code_language import detect_code_language
+from docling.utils.markdown_math import (
+    LiteralCodeData,
+    MathData,
+    _contains_math,
+    _split_display_math,
+    _split_math_runs,
+    create_math_extension,
+)
 from docling.utils.text_decoding import decode_text
 
 _MARKO_AVAILABLE: bool = False
@@ -147,9 +158,7 @@ def _only_plain_line_breaks(children: list) -> bool:
     by LineBreak nodes (soft or hard), with at least one break present.
 
     Such content is fully handled by the pending-line-break merge paths and does
-    not need an inline_group wrapper.  Multiple plain runs without any LineBreak
-    (e.g. `RawText + Literal + RawText` from an escaped character) return False
-    so they still use the regular inline_group path.
+    not need an inline_group wrapper.
 
     Args:
         children: Inline child nodes of a marko Paragraph, Heading, or ListItem
@@ -177,6 +186,44 @@ _FRONTMATTER_PATTERN = re.compile(
 )
 
 
+_CHAR_REFERENCE_PATTERN = re.compile(
+    r"&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]*);"
+)
+
+
+def _decode_char_references(text: str) -> str:
+    """Decode the HTML character references of a Markdown text, as CommonMark does.
+
+    Only a reference that ends with a semicolon and names a known entity or a
+    code point is decoded. `html.unescape` also decodes legacy names without a
+    semicolon (`&copy`), the longest legacy prefix of an unknown name
+    (`&notit;`) and remaps some numeric references (`&#128;` to `€`, `&#1;` to
+    nothing). CommonMark keeps the first two as literal text and maps a number
+    directly to its code point, except for 0, surrogates and values out of
+    range, which give U+FFFD.
+
+    Args:
+        text: Text of a marko `RawText` node or of a title.
+
+    Returns:
+        The text with each valid character reference replaced by its characters.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        reference = match.group(0)
+        if reference[1] != "#":
+            return html5.get(reference[1:], reference)
+        if reference[2] in "xX":
+            code_point = int(reference[3:-1], 16)
+        else:
+            code_point = int(reference[2:-1])
+        if code_point == 0 or code_point > 0x10FFFF or 0xD800 <= code_point <= 0xDFFF:
+            return "\ufffd"
+        return chr(code_point)
+
+    return _CHAR_REFERENCE_PATTERN.sub(replace, text)
+
+
 def _strip_frontmatter(text: str) -> str:
     """Drop a leading YAML frontmatter block (a ``---`` fenced YAML mapping)."""
     match = _FRONTMATTER_PATTERN.match(text)
@@ -187,6 +234,65 @@ def _strip_frontmatter(text: str) -> str:
     except yaml.YAMLError:
         return text
     return text[match.end() :] if isinstance(meta, dict) else text
+
+
+def _text_run_piece(node: marko.inline.RawText | marko.inline.Literal) -> str:
+    """Return the final text of a run, with every `&` kept as an entity.
+
+    The character references of a `RawText` are decoded when the item is created.
+    Each piece is decoded here and its `&` is escaped again, so that this later
+    step returns the merged text unchanged and an escape still protects its
+    neighbors.
+    """
+    text = node.children if isinstance(node.children, str) else ""
+    if isinstance(node, marko.inline.RawText):
+        text = _decode_char_references(text)
+    return text.replace("&", "&amp;")
+
+
+def _merge_run(
+    run: list[marko.inline.RawText | marko.inline.Literal],
+) -> list[marko.element.Element]:
+    """Return the nodes that replace a run of neighboring text nodes.
+
+    A run of two or more nodes becomes one RawText. A single node stays as it is.
+    """
+    if len(run) < 2:
+        return list(run)
+    return [marko.inline.RawText("".join(_text_run_piece(node) for node in run))]
+
+
+def _merge_adjacent_text_runs(root: marko.element.Element) -> None:
+    """Merge neighboring RawText and Literal nodes into one RawText node.
+
+    A backslash escape (``snake\\_case``) is a Literal node between two RawText
+    nodes. Merging them keeps the escape in the text run around it.
+
+    Args:
+        root: The root of the marko AST. Its descendants are changed in place.
+    """
+    stack: list[marko.element.Element] = [root]
+    while stack:
+        element = stack.pop()
+        if not isinstance(
+            element, marko.block.BlockElement | marko.inline.InlineElement
+        ):
+            continue
+        children = element.children
+        if not isinstance(children, list):
+            continue
+        merged: list[marko.element.Element] = []
+        run: list[marko.inline.RawText | marko.inline.Literal] = []
+        for child in children:
+            if isinstance(child, marko.inline.RawText | marko.inline.Literal):
+                run.append(child)
+                continue
+            merged.extend(_merge_run(run))
+            run = []
+            merged.append(child)
+            stack.append(child)
+        merged.extend(_merge_run(run))
+        element.children = merged
 
 
 class MarkdownDocumentBackend(DeclarativeDocumentBackend):
@@ -325,8 +431,8 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
         """Return the plain-text content of a GFM `TableCell`.
 
         Unlike `_inline_text`, this method treats `CodeSpan` nodes as literal
-        text (no HTML unescaping) and HTML-unescapes only `RawText` and
-        `Literal` nodes.
+        text (no character reference decoding) and decodes the character
+        references of `RawText` and `Literal` nodes only.
 
         Args:
             cell: A parsed GFM `TableCell` element.
@@ -336,10 +442,12 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
         """
 
         def _node_text(node) -> str:
+            if isinstance(node, LiteralCodeData):
+                return node.code
             if isinstance(node, marko.inline.CodeSpan):
                 return str(node.children)
             if isinstance(node.children, str):
-                return unescape(node.children)
+                return _decode_char_references(node.children)
             return "".join(_node_text(c) for c in node.children)
 
         return "".join(_node_text(child) for child in cell.children)
@@ -368,6 +476,8 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             marko.inline.AutoLink,
             marko.inline.Image,
             _GfmStrikethrough,
+            MathData,
+            LiteralCodeData,
         )
 
         def _check(node) -> bool:
@@ -423,17 +533,24 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                         name=group_name,
                         parent=docling_table,
                     )
-                    inline_group = doc.add_inline_group(parent=cell_group)
+                    inline_group = None
                     inline_refs: list[RefItem] = []
-                    for child in cell.children:
-                        self._iterate_cell_inline(
-                            element=child,
-                            doc=doc,
-                            inline_parent=inline_group,
-                            collected_refs=inline_refs,
-                            formatting=None,
-                            hyperlink=None,
-                        )
+                    for children, display in _split_math_runs(cell.children):
+                        if display:
+                            inline_group = None
+                            child_parent = cell_group
+                        else:
+                            inline_group = doc.add_inline_group(parent=cell_group)
+                            child_parent = inline_group
+                        for child in children:
+                            self._iterate_cell_inline(
+                                element=child,
+                                doc=doc,
+                                inline_parent=child_parent,
+                                collected_refs=inline_refs,
+                                formatting=None,
+                                hyperlink=None,
+                            )
 
                     if inline_refs:
                         doc.add_table_cell(
@@ -453,7 +570,8 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                         )
                     else:
                         # No items created; clean up unused groups.
-                        doc.groups.remove(inline_group)
+                        if inline_group is not None:
+                            doc.groups.remove(inline_group)
                         doc.groups.remove(cell_group)
                         docling_table.children.pop()
                         doc.add_table_cell(
@@ -557,8 +675,29 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     hyperlink=link_hyperlink,
                 )
 
-        elif isinstance(element, marko.inline.CodeSpan):
-            snippet = str(element.children).strip()
+        elif isinstance(element, MathData):
+            parent = inline_parent
+            if (
+                element.display
+                and isinstance(inline_parent, InlineGroup)
+                and inline_parent.parent is not None
+            ):
+                parent = inline_parent.parent.resolve(doc)
+            item = doc.add_formula(
+                parent=parent,
+                text=element.latex,
+                orig=element.children,
+                formatting=formatting,
+                hyperlink=hyperlink,
+            )
+            collected_refs.append(item.get_ref())
+
+        elif isinstance(element, marko.inline.CodeSpan | LiteralCodeData):
+            snippet = (
+                element.code
+                if isinstance(element, LiteralCodeData)
+                else str(element.children)
+            ).strip()
             if snippet:
                 item = doc.add_code(
                     parent=inline_parent,
@@ -572,7 +711,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             raw = element.children if isinstance(element.children, str) else ""
             # Keep the raw fragment: its edge whitespace is the run boundary. Marko has
             # already trimmed the cell edges, and whitespace-only runs are significant.
-            text = unescape(raw)
+            text = _decode_char_references(raw)
             if text:
                 item = doc.add_text(
                     label=DocItemLabel.TEXT,
@@ -601,7 +740,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             image_ref = self._load_image_ref(element.dest)
             fig_caption = None
             if element.title:
-                title = unescape(element.title)
+                title = _decode_char_references(element.title)
                 fig_caption = doc.add_text(
                     label=DocItemLabel.CAPTION,
                     text=title,
@@ -771,7 +910,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                 element.children[0].children,  # type: ignore
             )
 
-            if len(element.children) > 1:  # inline group will be created further down
+            if len(element.children) > 1 or _contains_math(element.children):
                 parent_item = self._create_heading_item(
                     doc=doc,
                     parent_item=parent_item,
@@ -824,9 +963,10 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             # Skip the inline_group path for items whose children are plain text
             # runs separated by line breaks; the pending-line-break merge paths
             # will produce a single list_item with the correct joined text.
-            if len(non_list_children) > 1 and not _only_plain_line_breaks(
-                non_list_children
-            ):  # inline group will be created further down
+            if (
+                len(non_list_children) > 1
+                and not _only_plain_line_breaks(non_list_children)
+            ) or _contains_math(non_list_children):
                 parent_ref: str | None = parent_item.self_ref if parent_item else None
                 parent_item = self._create_list_item(
                     doc=doc,
@@ -869,7 +1009,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
 
             fig_caption: TextItem | None = None
             if element.title is not None and element.title != "":
-                title = unescape(element.title)
+                title = _decode_char_references(element.title)
                 fig_caption = doc.add_text(
                     label=DocItemLabel.CAPTION,
                     text=title,
@@ -912,8 +1052,8 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             # Keep the raw fragment: whitespace at a `RawText` edge is the boundary between
             # inline runs (`Foo *emph* bar` -> `"Foo "`, `"emph"`, `" bar"`) and the serializers
             # concatenate faithfully. Marko has already trimmed the block edges for us.
-            snippet_text = unescape(original_text)
-            stripped_text = unescape(original_text.strip())
+            snippet_text = _decode_char_references(original_text)
+            stripped_text = _decode_char_references(original_text.strip())
             # A whitespace-only run is kept between runs, but never becomes a heading/list item.
             if snippet_text and (stripped_text or not creation_stack):
                 if creation_stack:
@@ -935,13 +1075,13 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                 else:
                     # A code span is its own item: text after a break never
                     # joins it (that would type prose as code).
-                    last_is_code = bool(doc.texts) and isinstance(
-                        doc.texts[-1], CodeItem
+                    last_is_literal = bool(doc.texts) and isinstance(
+                        doc.texts[-1], CodeItem | FormulaItem
                     )
                     if (
                         self._pending_hard_line_break
                         and doc.texts
-                        and not last_is_code
+                        and not last_is_literal
                         and doc.texts[-1].formatting == formatting
                         and doc.texts[-1].hyperlink == hyperlink
                     ):
@@ -950,7 +1090,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     elif (
                         self._pending_soft_line_break
                         and doc.texts
-                        and not last_is_code
+                        and not last_is_literal
                         and doc.texts[-1].formatting == formatting
                         and doc.texts[-1].hyperlink == hyperlink
                     ):
@@ -975,9 +1115,31 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     self._pending_hard_line_break = False
                     self._pending_soft_line_break = False
 
-        elif isinstance(element, marko.inline.CodeSpan):
+        elif isinstance(element, MathData):
+            if self._pending_hard_line_break or self._pending_soft_line_break:
+                doc.add_text(
+                    label=DocItemLabel.TEXT,
+                    parent=parent_item,
+                    text="\n" if self._pending_hard_line_break else " ",
+                )
+            doc.add_formula(
+                parent=parent_item,
+                text=element.latex,
+                orig=element.children,
+                formatting=formatting,
+                hyperlink=hyperlink,
+            )
+            self._pending_hard_line_break = False
+            self._pending_soft_line_break = False
+            return
+
+        elif isinstance(element, marko.inline.CodeSpan | LiteralCodeData):
             _log.debug(" - Code Span: %s", element.children)
-            snippet_text = str(element.children).strip()
+            snippet_text = (
+                element.code
+                if isinstance(element, LiteralCodeData)
+                else str(element.children)
+            ).strip()
             # If this CodeSpan is the only content of a list item / heading, Marko won't
             # emit RawText. Flush pending creations here to avoid leaking payloads.
             if creation_stack and snippet_text:
@@ -1078,10 +1240,20 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                 _log.debug("Some other element: %s", type(element).__name__)
 
         element_children = getattr(element, "children", [])
+        split_display = isinstance(
+            element,
+            marko.block.Paragraph | marko.block.Heading | marko.block.SetextHeading,
+        ) and _contains_math(element_children, display_only=True)
+        if split_display:
+            element_children = _split_display_math(element_children)
         if (
-            isinstance(element, marko.block.Paragraph | marko.block.Heading)
-            and len(element_children) > 1
+            isinstance(
+                element,
+                marko.block.Paragraph | marko.block.Heading | marko.block.SetextHeading,
+            )
+            and (len(element_children) > 1 or _contains_math(element_children))
             and not _only_plain_line_breaks(element_children)
+            and not split_display
         ):
             parent_item = doc.add_inline_group(parent=parent_item)
 
@@ -1089,12 +1261,13 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             marko.block.CodeBlock,
             marko.block.FencedCode,
             marko.inline.RawText,
+            LiteralCodeData,
         )
 
         if hasattr(element, "children") and not isinstance(
             element, processed_block_types
         ):
-            for child in element.children:
+            for child in element_children:
                 if (
                     isinstance(element, marko.block.ListItem)
                     and isinstance(child, marko.block.List)
@@ -1215,8 +1388,12 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
         if self.is_valid():
             # The GFM extension gives tables a structured AST with inline
             # children per cell, enabling RichTableCell for formatted content.
-            marko_parser = Markdown(extensions=[_GFM_EXTENSION])
+            extensions = [_GFM_EXTENSION]
+            if cast(MarkdownBackendOptions, self.options).enable_latex_math:
+                extensions.append(create_math_extension())
+            marko_parser = Markdown(extensions=extensions)
             parsed_ast = marko_parser.parse(self.markdown)
+            _merge_adjacent_text_runs(parsed_ast)
             self._iterate_elements(
                 element=parsed_ast,
                 depth=0,
@@ -1277,6 +1454,8 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     path_or_stream=stream,
                     options=html_options,
                     picture_refs=html_payload.picture_refs,
+                    formula_refs=html_payload.formula_refs,
+                    line_break_ref=html_payload.line_break_ref,
                 )
                 doc = html_backend_obj.convert()
         else:
